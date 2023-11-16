@@ -1,0 +1,341 @@
+# import spotipy library
+import spotipy
+from spotipy.oauth2 import SpotifyClientCredentials
+from spotipy.oauth2 import SpotifyOAuth
+import os
+import pandas as pd
+import datetime
+import pyodbc
+import sys
+import numpy
+from requests.exceptions import ReadTimeout
+
+
+
+
+
+def SpotifyAPICall():
+    today = datetime.datetime.now()
+    todaydateformat = datetime.datetime.now().date()
+    yesterday = today - datetime.timedelta(days=1)
+
+    yesterday_unix_timestamp = int(yesterday.timestamp())
+    today_unix_timestamp = int(today.timestamp())
+
+
+    # setting up the credentials
+    os.environ['SPOTIPY_CLIENT_ID'] = '1bb456ae6dc943f0a1f62f01485666a7'
+    os.environ['SPOTIPY_CLIENT_SECRET'] = '78b0b04117ef4f5c904cafa9724bdfa6'
+    os.environ['SPOTIPY_REDIRECT_URI'] = 'http://localhost:8888/callback'
+
+
+
+
+    sp = spotipy.Spotify(auth_manager=SpotifyOAuth(scope="user-read-recently-played"))
+    results = sp.current_user_recently_played(after = yesterday_unix_timestamp)
+
+
+
+    recentlyplayeddatalist = []
+
+    for item in results['items']:
+        recentlyplayeddatadict = {}
+
+        tracks = item['track']
+        artists = item['track']['album']['artists']
+        recentlyplayeddatadict['Album'] = item['track']['album']['name']
+        recentlyplayeddatadict['TrackName'] = tracks['name']
+        recentlyplayeddatadict['TrackID'] = tracks['id']
+        recentlyplayeddatadict['PlayedatDate'] = item['played_at']
+        for artists in artists:
+            recentlyplayeddatadict['Artist'] = artists['name']
+            recentlyplayeddatadict['ArtistID'] = artists['id']
+        recentlyplayeddatalist.append(recentlyplayeddatadict)
+
+
+    recentlyplayeddf = pd.DataFrame.from_dict(recentlyplayeddatalist, orient='columns')
+    recentlyplayeddf['PlayedatDate'] = pd.to_datetime(recentlyplayeddf['PlayedatDate']) - pd.Timedelta(hours=6) #Spotify API gives played at date 6 hours ahead
+
+    recentlyplayeddf['TimeStamp'] = yesterday
+
+    return recentlyplayeddf
+
+
+def SpotifyAPICallArtists():
+ 
+        # setting up the credentials
+    os.environ['SPOTIPY_CLIENT_ID'] = '1bb456ae6dc943f0a1f62f01485666a7'
+    os.environ['SPOTIPY_CLIENT_SECRET'] = '78b0b04117ef4f5c904cafa9724bdfa6'
+    os.environ['SPOTIPY_REDIRECT_URI'] = 'http://localhost:8888/callback'
+
+    sp = spotipy.Spotify(auth_manager=SpotifyOAuth(scope="user-read-recently-played"))
+
+    recentlyplayeddf = SpotifyAPICall()
+
+    ArtistIDs  = recentlyplayeddf['ArtistID'].to_list()
+
+    ArtistGenreList = []
+
+    for ids in ArtistIDs:
+        ArtistGenreDict = {}
+        ArtistGenreDict['ArtistID'] = ids
+        artistresults = sp.artist(ids)
+        genres = artistresults['genres']
+        ArtistGenreDict['ArtistName'] = artistresults['name']
+        try:
+            ArtistGenreDict['Genre'] = genres[0]
+
+        except:
+            ArtistGenreDict['Genre'] = "NA"
+        ArtistGenreList.append(ArtistGenreDict)
+
+
+    artistsdata = pd.DataFrame.from_dict(ArtistGenreList, orient='columns')
+    artistsdata = artistsdata.drop_duplicates(subset = ['ArtistID'])
+
+    return artistsdata
+
+
+
+
+def SpotifyAPICallTracks():
+ 
+        # setting up the credentials
+    os.environ['SPOTIPY_CLIENT_ID'] = '1bb456ae6dc943f0a1f62f01485666a7'
+    os.environ['SPOTIPY_CLIENT_SECRET'] = '78b0b04117ef4f5c904cafa9724bdfa6'
+    os.environ['SPOTIPY_REDIRECT_URI'] = 'http://localhost:8888/callback'
+
+    sp = spotipy.Spotify(auth_manager=SpotifyOAuth(scope="user-read-recently-played"))
+
+
+
+    recentlyplayeddf = SpotifyAPICall()
+    TrackIDs  = recentlyplayeddf['TrackID'].to_list()
+    
+    Track_List = []
+
+
+
+    for ids in TrackIDs:
+        TrackDict = {}
+
+        trackdata = sp.track(ids)
+        TrackDict['TrackID'] = ids
+        TrackDict['TrackName'] = trackdata['name']
+        TrackDict['Duration_ms'] = trackdata['duration_ms']
+
+        Track_List.append(TrackDict)
+
+    trackdata = pd.DataFrame.from_dict(Track_List, orient='columns')
+    trackdata = trackdata.drop_duplicates(subset = ['TrackID'])
+
+
+    return trackdata
+
+
+
+
+def create_server_connection():
+
+    conn_str = (
+        r'DRIVER={ODBC Driver 17 for SQL Server};'
+        r'SERVER=SAROSHSPC;'
+        r'DATABASE=SpotifyListeningHistory;'
+        r'Trusted_Connection=yes;'
+    )
+
+    pyodbc.connect(conn_str)
+
+    try:
+        conn = pyodbc.connect(conn_str)
+    except Exception as e:
+        print(e)
+        print('task is terminated')
+        sys.exit()
+    else:
+        cursor = conn.cursor()
+    return cursor
+
+
+
+def delta_load_listening_history():
+
+    cursor_connection = create_server_connection()
+    listeninghistorydf = SpotifyAPICall()
+
+    playedatquery = """Select PlayedatDate
+                        from ListeningHistory"""
+
+
+    listeninghistoryresult = cursor_connection.execute(playedatquery)
+
+    existingPKs = []
+
+    
+
+    for row in listeninghistoryresult:
+        existingPKs.append(row.PlayedatDate.strftime("%m/%d/%Y %H:%M:%S"))
+
+    listeninghistorydf['PlayedatDate'] = listeninghistorydf['PlayedatDate'].dt.strftime("%m/%d/%Y %H:%M:%S")
+
+    listeninghistorydf['DeltaLoad'] = [False if val in existingPKs else True for val in listeninghistorydf['PlayedatDate']]
+
+    listeninghistorydf  = listeninghistorydf[listeninghistorydf['DeltaLoad'] == True]
+
+    return listeninghistorydf
+
+
+def delta_load_artists():
+    
+    artistsdata = SpotifyAPICallArtists()
+    
+    artistsquery = """Select ArtistID
+                        from Artists"""
+     
+    cursor_connection = create_server_connection()
+    artistresults = cursor_connection.execute(artistsquery)
+    existingartistIDs = []
+    
+    for row in artistresults:
+        existingartistIDs.append(row.ArtistID)
+    
+    artistsdata['DeltaLoad'] = [False if val in existingartistIDs else True for val in artistsdata['ArtistID']]
+    
+    artistsdata  = artistsdata[artistsdata['DeltaLoad'] == True]
+    
+    return artistsdata
+
+
+
+def delta_load_tracks():
+    
+    track_data = SpotifyAPICallTracks()
+    
+    track_query = """Select TrackID
+                        from Tracks"""
+     
+    cursor_connection = create_server_connection()
+    track_results = cursor_connection.execute(track_query)
+    existing_track_ids = []
+    
+    for row in track_results:
+        existing_track_ids.append(row.TrackID)
+    
+    track_data['DeltaLoad'] = [False if val in existing_track_ids else True for val in track_data['TrackID']]
+    
+    track_data  = track_data[track_data['DeltaLoad'] == True]
+    
+    return track_data
+
+
+
+
+
+
+def insert_new_records_listening_history():
+
+    cursor_connection = create_server_connection()
+    listeninghistorydf = delta_load_listening_history()
+
+    inserthistory_statement = """
+                      INSERT INTO ListeningHistory
+                      (TrackID,TrackName, AlbumName,ArtistID,PlayedatDate,LoadDate)
+                      VALUES(?,?,?,?,?,?)
+                      """
+   
+    try:
+        for rows in listeninghistorydf.itertuples():
+            insertlist = []
+            insertlist.append(getattr(rows,"TrackID"))
+            insertlist.append(getattr(rows,"TrackName"))
+            insertlist.append(getattr(rows,"Album"))
+            insertlist.append(getattr(rows,"ArtistID"))
+            insertlist.append(getattr(rows, "PlayedatDate"))
+            insertlist.append(getattr(rows, "TimeStamp"))
+            cursor_connection.execute(inserthistory_statement,insertlist)
+
+    except Exception as e:
+        cursor_connection.rollback()
+        print(e.value)
+        print('transaction rolled back')
+    else:
+        print('records inserted successfully')
+        cursor_connection.commit()
+        cursor_connection.close()
+
+
+
+
+def insert_new_records_artist():
+    artistsdata = delta_load_artists()
+    cursor_connection = create_server_connection()
+  
+     
+    insertartists_statement = """
+                      INSERT INTO Artists
+                      (ArtistID, ArtistName,Genre)
+                      VALUES(?,?,?)
+                      """
+
+    try:
+        for rows in artistsdata.itertuples():
+            insertartistlist = []
+            insertartistlist.append(getattr(rows,"ArtistID"))
+            insertartistlist.append(getattr(rows,"ArtistName"))
+            insertartistlist.append(getattr(rows, "Genre"))
+            cursor_connection.execute(insertartists_statement,insertartistlist)
+        
+
+    except Exception as e:
+        cursor_connection.rollback()
+        print(e.value)
+        print('transaction rolled back')
+    else:
+        print('records inserted successfully')
+        cursor_connection.commit()
+        cursor_connection.close()
+
+
+
+def insert_new_records_tracks():
+    trackdata = delta_load_tracks()
+    cursor_connection = create_server_connection()
+  
+     
+    inserttracks_statement = """
+                      INSERT INTO Tracks
+                      (TrackID, TrackName,Duration_ms)
+                      VALUES(?,?,?)
+                      """
+
+    try:
+        for rows in trackdata.itertuples():
+            inserttracklist = []
+            inserttracklist.append(getattr(rows,"TrackID"))
+            inserttracklist.append(getattr(rows,"TrackName"))
+            inserttracklist.append(getattr(rows, "Duration_ms"))
+            cursor_connection.execute(inserttracks_statement,inserttracklist)
+        
+
+    except Exception as e:
+        cursor_connection.rollback()
+        print(e.value)
+        print('transaction rolled back')
+    else:
+        print('records inserted successfully')
+        cursor_connection.commit()
+        cursor_connection.close()
+
+
+
+
+def SpotifyETL():
+    delta_load_listening_history()
+    delta_load_artists()
+    delta_load_tracks()
+    insert_new_records_tracks()
+    insert_new_records_artist()
+    insert_new_records_listening_history()
+    
+
+SpotifyETL()
